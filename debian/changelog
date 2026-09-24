@@ -1,0 +1,7 @@
+hwsv4l2 (26.09.0) unstable; urgency=medium
+
+  * First release: every input of an HWS card a capture node by the frame
+    contract of sdi_av.h -- the picture, the stereo audio of the frame and
+    the metadata -- with the frame rate measured by the driver.
+
+ -- Max Lapshin <max@flussonic.com>  Thu, 24 Sep 2026 22:00:00 +0000

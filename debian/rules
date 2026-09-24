@@ -1,0 +1,35 @@
+#!/usr/bin/make -f
+include /usr/share/dpkg/pkg-info.mk
+
+NAME    := hwsv4l2
+VERSION := $(shell sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)
+SRC     := debian/$(NAME)-dkms/usr/src/$(NAME)-$(VERSION)
+
+%:
+	dh $@ --with dkms
+
+# The module is built by dkms on the machine it runs on, not here.
+override_dh_auto_configure:
+	test "$(DEB_VERSION_UPSTREAM)" = "$(VERSION)" || \
+	  { echo "debian/changelog says $(DEB_VERSION_UPSTREAM), dkms.conf says $(VERSION)" >&2; exit 1; }
+
+override_dh_auto_build:
+
+override_dh_auto_clean:
+
+# dkms.conf itself goes in through debian/hwsv4l2-dkms.dkms (dh_dkms).
+override_dh_auto_install:
+	install -d $(SRC)/hwsv4l2 $(SRC)/include
+	install -m 0644 Makefile Kbuild $(SRC)/
+	install -m 0644 hwsv4l2/*.c hwsv4l2/*.h $(SRC)/hwsv4l2/
+	install -m 0644 include/sdi_av.h include/hwav.h $(SRC)/include/
+	install -D -m 0644 packaging/modprobe.d/hwsv4l2.conf \
+	  debian/$(NAME)-dkms/etc/modprobe.d/hwsv4l2.conf
+	install -D -m 0644 include/sdi_av.h debian/$(NAME)-dev/usr/include/sdi_av.h
+	install -D -m 0644 include/hwav.h debian/$(NAME)-dev/usr/include/hwav.h
+
+# gzip for both members: some apt repository indexers take a
+# package only when its control member is control.tar.gz (zstd and xz are
+# what dpkg-deb picks by itself on a current Debian).
+override_dh_builddeb:
+	dh_builddeb -- -Zgzip --uniform-compression

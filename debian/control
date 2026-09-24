@@ -1,0 +1,28 @@
+Source: hwsv4l2
+Section: kernel
+Priority: optional
+Maintainer: Max Lapshin <max@flussonic.com>
+Build-Depends: debhelper-compat (= 13), dh-dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/flussonic/avmatrix-v4l2
+Rules-Requires-Root: no
+
+Package: hwsv4l2-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Recommends: linux-headers-generic | linux-headers-amd64 | linux-headers-arm64
+Description: V4L2 driver for AVMatrix HWS capture cards (DKMS source)
+ Every input of an AVMatrix HWS PCIe card gets a multi-planar V4L2 capture
+ node whose buffers carry the picture, the frame's audio and per-frame
+ metadata, laid out like those of the SDI cards.
+ .
+ The module is built by DKMS for every installed kernel. The package keeps
+ HwsCapture, the other driver of these cards, from autoloading, since
+ whichever loads first owns them.
+
+Package: hwsv4l2-dev
+Architecture: all
+Depends: ${misc:Depends}
+Description: V4L2 driver for AVMatrix HWS capture cards (client header)
+ The headers a program needs to read the buffers of the hwsv4l2 nodes:
+ pixel formats, the layout of the audio plane and the per-frame metadata.
