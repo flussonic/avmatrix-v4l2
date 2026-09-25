@@ -9,7 +9,10 @@ them and in the client. So a program that captures from a DeckLink, a KONA
 or a DekTec card captures from an HWS input with the same code; the
 streamer's SDI input takes these nodes as they are. The vendor block
 declared in `include/hwav.h` carries what only this card tells: the raster
-the input arrived in, the card's own frame rate count, HDCP.
+the input arrived in and, on boards past version 121, the card's own frame
+rate count and HDCP. What HDMI carries beyond picture and stereo sound --
+InfoFrames, HDR, the audio format, CEC -- the card does not pass on
+(`docs/hardware.md`).
 
 The module is ours, written against the card's registers. What those
 registers are and how the card has to be started comes from the driver of
@@ -141,7 +144,7 @@ is still half a frame away from overwriting it.
 
 ## State
 
-Brought up on an HWS X4 HDMI (8888:8504, board version 255.121) under
+Brought up on an HWS X4 HDMI (8888:8504, board version 121.0) under
 Ubuntu 24.04 with kernel 6.14, with a Roku player on input 3 sending
 1080p59.94: the rate detected as 59.94, capture through MMAP and USERPTR in
 UYVY and YUYV, 600-frame runs without a gap, a lost event or a split frame
@@ -172,7 +175,8 @@ The names next to a node, their meaning and the rule for a counter the card
 cannot report are the contract in `docs/sdi-sysfs.md`, shared with our SDI
 drivers. A node carries `frames`, `frames_skipped`, `no_buffer`, `no_sync`,
 `resyncs`, `events_missed`, `dma_errors`, `restarts` and `signal`, and one of
-its own, `hdcp`. `resyncs` counts frames given up because the poll moved the
+its own, `hdcp`, on boards past version 121 (the earlier ones do not report
+it). `resyncs` counts frames given up because the poll moved the
 register too late, `dma_errors` frames that did not arrive whole -- the
 next frame reached the copy, or the split could not be placed. The card
 counts no line CRCs, so there is no `crc_errors`.

@@ -1,7 +1,7 @@
 # What the HWS card was seen to do
 
 Measured on an HWS X4 HDMI (PCI 8888:8504, subsystem 8888:0007, board
-version 255.121) in a PCIe 2.0 x4 slot, Ubuntu 24.04, kernel 6.14, with a
+version 121.0: word 88 reads 0x000079ff) in a PCIe 2.0 x4 slot, Ubuntu 24.04, kernel 6.14, with a
 Roku player sending 1080p59.94 to input 3. The register map is in
 `hwsv4l2/hwsv4l2_regs.h`; what follows is what the driver's design rests on,
 each point with the experiment behind it, so that a different board or a
@@ -69,6 +69,11 @@ around the expected crossing, and a frame is put together from two slots.
 - The input frame rate register (word 110 + input) read 0 for the Roku
   input; the output rate register (word 130 + input) read 1 and did not
   take a write. The rate is the driver's measurement.
+- Those words, the HDCP word (8) and the transfer limit (9) belong to the
+  later register set: the vendor's driver uses them only past board version
+  121 (bits 15..8 of word 88), and this board is 121. Earlier versions of
+  this driver read the version from bits 7..0 (255) and took the board for a
+  later one.
 - The raster register (word 90 + 2 x input) gave 1920x1080 as soon as the
   signal was there.
 
@@ -79,6 +84,29 @@ around the expected crossing, and a frame is put together from two slots.
   input) names the one being written. 46.87 packets a second, 48 000
   samples: the audio clock of the Roku input against the host clock over a
   10-second capture came out at 47 999.5 to 48 000.5.
+
+## What the card tells of an HDMI input, and what not
+
+- The whole register space was read once with two inputs capturing: BAR0 is
+  64 KiB, of which the capture core is a bank of 128 words at 0x4000
+  mirrored every 0x200 bytes up to 0x7fff, the bridge a block mirrored every
+  0x1000 below it with the PCI configuration space at offset 0, and the rest
+  reads 0. Every live word is one the vendor's driver knows. None of the
+  drivers of the family (the vendor's, benhoff/hws, the VC12-4K and VC41/42
+  ones) has an I2C, SPI or command channel to the HDMI receiver.
+- With a KONA 5 HDMI output on input 2 the words were compared before and
+  after switching the source to RGB, to full range, to 10-bit colour, to two
+  audio channels and to DVI: no word of the core moved. So nothing of the
+  InfoFrames (source name, pixel encoding, range, colorimetry, HDR), of the
+  audio format, of CEC or of the link reaches the host; the EDID the inputs
+  present is the card's own (a sink named MV360, manufacturer YHW, product
+  0x2369) and cannot be changed.
+- YCbCr from the source is passed through untouched: 75% bars in 4:2:2
+  limited range came out byte for byte. RGB is not: the same bars sent as
+  RGB, limited or full range, came out with every value off (white 75% as Y
+  137, Cb 122, Cr 38). The card does not read the source's AVI InfoFrame and
+  the driver cannot tell an RGB source; its EDID offers YCbCr, which sources
+  that honour it send.
 
 ## Starting and stopping
 

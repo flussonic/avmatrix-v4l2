@@ -79,7 +79,11 @@ static ssize_t signal_show(struct device *dev, struct device_attribute *attr, ch
 }
 static DEVICE_ATTR_RO(signal);
 
-/* Of this driver: whether the source protects the input with HDCP. */
+/*
+ * Of this driver: whether the source protects the input with HDCP. Only a
+ * board with the later register set tells (regs_v1); elsewhere there is no
+ * file, rather than a 0 that would read as "not protected".
+ */
 static ssize_t hdcp_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct hws_chan *c = chan_of(dev);
@@ -104,8 +108,16 @@ static struct attribute *hws_node_attrs[] = {
 	NULL,
 };
 
+static umode_t hws_node_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	if (attr == &dev_attr_hdcp.attr && !chan_of(kobj_to_dev(kobj))->card->regs_v1)
+		return 0;
+	return attr->mode;
+}
+
 static const struct attribute_group hws_node_group = {
 	.attrs = hws_node_attrs,
+	.is_visible = hws_node_visible,
 };
 
 /*

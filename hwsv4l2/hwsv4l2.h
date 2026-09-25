@@ -207,6 +207,11 @@ struct hws_card {
 	unsigned int naudio;		/* of those with audio */
 	u32 device_ver;
 	u32 sub_ver;
+	/*
+	 * The later register set: the input frame rate, the HDCP bits and the
+	 * transfer limit. Boards up to version 121 read those words as zero.
+	 */
+	bool regs_v1;
 	spinlock_t reg_lock;		/* read-modify-write of shared registers */
 	struct mutex start_lock;	/* starting the core again while channels run */
 	struct hws_chan *ch[HWS_MAX_CHANNELS];

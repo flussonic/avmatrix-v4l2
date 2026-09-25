@@ -70,13 +70,14 @@ int hws_card_start(struct hws_card *card)
 	info = hws_rd(card, HWS_REG_DEVICE_INFO);
 	if (info == 0xffffffff)
 		return -ENODEV;
-	card->device_ver = info & 0xff;
-	card->sub_ver = (info >> 8) & 0xff;
+	card->device_ver = (info >> 8) & 0xff;
+	card->sub_ver = (info >> 16) & 0xff;
+	/* Past version 121, the one-input 122 excepted, as the vendor's driver has it. */
+	card->regs_v1 = card->device_ver > 121 && !(pdev->device == 0x8501 && card->device_ver == 122);
 
 	hws_wr(card, HWS_REG_DEC_MODE, 0);
 	hws_wr(card, HWS_REG_DEC_MODE, HWS_DEC_MODE_STOP);
-	/* Boards past version 121 need the transfer limit; the one-input 122 does not. */
-	if (card->device_ver > 121 && !(pdev->device == 0x8501 && card->device_ver == 122)) {
+	if (card->regs_v1) {
 		hws_wr(card, HWS_REG_DMA_MAX, HWS_MAX_WIDTH * HWS_MAX_HEIGHT * 2 / 16);
 		hws_rd(card, HWS_REG_DMA_MAX);
 	}
@@ -188,14 +189,14 @@ void hws_read_input(struct hws_card *card, unsigned int ch, struct hws_input *in
 {
 	u32 active = hws_rd(card, HWS_REG_ACTIVE);
 	u32 res = hws_rd(card, HWS_REG_IN_RES(ch));
-	u32 fps = hws_rd(card, HWS_REG_IN_FPS(ch));
+	u32 fps = card->regs_v1 ? hws_rd(card, HWS_REG_IN_FPS(ch)) : 0;
 
 	memset(in, 0, sizeof(*in));
 	if (active == 0xffffffff)
 		return;
 	in->signal = active & HWS_ACTIVE_SIGNAL(ch);
 	in->interlaced = active & HWS_ACTIVE_INTERLACED(ch);
-	in->hdcp = hws_rd(card, HWS_REG_HDCP) & BIT(ch);
+	in->hdcp = card->regs_v1 && (hws_rd(card, HWS_REG_HDCP) & BIT(ch));
 	if (!in->signal)
 		return;
 	in->width = res & 0xffff;
