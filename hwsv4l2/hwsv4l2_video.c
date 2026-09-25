@@ -487,7 +487,7 @@ void hws_video_done(struct hws_chan *c, u64 now_ns)
 		} else {
 			c->frames[c->nframes++] = *f;
 		}
-		schedule_work(&c->done_work);
+		queue_work(c->card->wq, &c->done_work);
 	} else if (f->top) {
 		hws_slot_put(f->top);
 		c->stat.resyncs++;
@@ -743,7 +743,7 @@ static void hws_watchdog(struct work_struct *w)
 			hws_restart(c);
 		mutex_unlock(&c->lock);
 	}
-	schedule_work(&c->done_work);
+	queue_work(c->card->wq, &c->done_work);
 	schedule_delayed_work(&c->watchdog, HWS_WATCHDOG_PERIOD);
 }
 

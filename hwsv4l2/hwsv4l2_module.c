@@ -127,7 +127,7 @@ static void hws_poll_card(struct hws_card *card, u64 now)
 		if (status & HWS_INT_ADONE(i)) {
 			hws_audio_done(c, at);
 			if (c->streaming && !list_empty(&c->waiting))
-				schedule_work(&c->done_work);
+				queue_work(card->wq, &c->done_work);
 		}
 		spin_unlock(&c->event_lock);
 	}
@@ -226,6 +226,7 @@ static void hws_card_release(struct v4l2_device *v4l2_dev)
 		kfree(card->ch[i]);
 	}
 	media_device_cleanup(&card->mdev);
+	destroy_workqueue(card->wq);
 	kfree(card);
 }
 
@@ -277,6 +278,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 #endif
 	card->v4l2_dev.release = hws_card_release;
 	pci_set_drvdata(pdev, card);
+	card->wq = alloc_workqueue("hwsv4l2-%s", WQ_UNBOUND | WQ_HIGHPRI, 0, pci_name(pdev));
+	if (!card->wq) {
+		ret = -ENOMEM;
+		goto err_card;
+	}
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -346,6 +352,8 @@ err_channels:
 	pci_clear_master(pdev);
 	hws_free_channels(card);
 err_card:
+	if (card->wq)
+		destroy_workqueue(card->wq);
 	kfree(card);
 	return ret;
 }

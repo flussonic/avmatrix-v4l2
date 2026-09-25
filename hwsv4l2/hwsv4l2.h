@@ -213,6 +213,13 @@ struct hws_card {
 	struct v4l2_device v4l2_dev;
 	struct media_device mdev;
 	struct delayed_work monitor;
+	/*
+	 * Where the channels copy their frames: unbound, so that two channels
+	 * copy on two CPUs at once rather than one after the other on the CPU
+	 * the poll ran on -- each copy has half a frame before the next frame
+	 * reaches it.
+	 */
+	struct workqueue_struct *wq;
 	struct hrtimer poll_timer;
 	struct mutex poll_lock;
 	unsigned int poll_users;	/* engines running; the poll runs while any does */
