@@ -115,7 +115,8 @@ unsigned int hws_audio_take(struct hws_chan *c, u64 ts, void *plane, size_t byte
 	/* What the ring no longer holds was overwritten before anyone took it. */
 	if (c->a_total > HWS_AUDIO_RING_FRAMES && start < c->a_total - HWS_AUDIO_RING_FRAMES)
 		start = c->a_total - HWS_AUDIO_RING_FRAMES;
-	n = min_t(u64, end - start, bytes / SDI_AUDIO_FRAME_BYTES);
+	/* Past the clamp the frame's own audio may be gone entirely. */
+	n = end > start ? min_t(u64, end - start, bytes / SDI_AUDIO_FRAME_BYTES) : 0;
 	memset(dst, 0, (size_t)n * SDI_AUDIO_FRAME_BYTES);
 	for (i = 0; i < n; i++) {
 		u32 s = c->aring[(start + i) % HWS_AUDIO_RING_FRAMES];
@@ -135,6 +136,9 @@ void hws_audio_start(struct hws_chan *c)
 
 	if (!c->has_audio)
 		return;
+	/* A done bit left from before is no packet of this run: gone before the poll may take one. */
+	hws_program_window(c, c->aud_dma, HWS_REG_AUDBUF(c->index));
+	hws_wr(card, HWS_REG_INT_STATUS, HWS_INT_ADONE(c->index));
 	spin_lock_irqsave(&c->event_lock, flags);
 	c->a_total = 0;
 	c->nmarks = 0;
@@ -142,8 +146,6 @@ void hws_audio_start(struct hws_chan *c)
 	c->audio_packets = 0;
 	c->a_started = true;
 	spin_unlock_irqrestore(&c->event_lock, flags);
-	hws_program_window(c, c->aud_dma, HWS_REG_AUDBUF(c->index));
-	hws_wr(card, HWS_REG_INT_STATUS, HWS_INT_ADONE(c->index));
 	hws_set_bits(card, HWS_REG_ACAP_ENABLE, BIT(c->index), true);
 }
 

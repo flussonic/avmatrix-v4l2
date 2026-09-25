@@ -124,7 +124,8 @@ bridge's interrupt enables are set, and most of them never reach the host
 as interrupts, on the legacy line and over MSI alike: a 59.94 Hz input gave
 25 to 40 interrupts a second. With the enables clear the bits latch, and
 the driver reads them every 250 us while an input captures (`poll_us`
-module parameter). The engine skips a frame whose predecessor's bit is still
+module parameter, 50 to 300: at 500 the card already loses a frame in ten).
+The engine skips a frame whose predecessor's bit is still
 up when it starts, so the poll is kept well inside the frame gap.
 
 The engine writes each line of a frame to its buffer register's address
@@ -149,6 +150,14 @@ device and all four nodes without a failure or a warning (the streaming
 part, `-s`, stops at the empty ANC and VBI planes, whose `bytesused` of 0 is
 what the contract asks for). The streamer's SDI input captured it for
 minutes as H.264 and AAC without a frame lost.
+
+Under a debug kernel (6.14 with KASAN, lockdep, kmemleak, UBSAN bounds and
+DMA API checks): five minutes of capture without a frame lost or a split
+line unresolved, start/stop on all four nodes at once, timings refused
+below 640x480 or of an odd width, the engine stopped under the watchdog
+while STREAMOFF comes and goes, unbind and bind while idle and while
+capturing, unbind with a node held open and closed afterwards -- no report,
+no leak.
 
 Not verified: interlaced inputs (the raster the card reports for them is
 taken as one field and the frame as woven -- no source of ours sends one to

@@ -22,11 +22,25 @@ static struct hws_chan *chan_of(struct device *dev)
 	return video_get_drvdata(vdev);
 }
 
+/* A counter as the poll left it: read under its lock, whole on 32-bit too. */
+static u64 hws_read_stat(struct hws_chan *c, const u64 *field)
+{
+	unsigned long flags;
+	u64 v;
+
+	spin_lock_irqsave(&c->event_lock, flags);
+	v = *field;
+	spin_unlock_irqrestore(&c->event_lock, flags);
+	return v;
+}
+
 #define HWS_COUNTER(name, field)						\
 static ssize_t name##_show(struct device *dev, struct device_attribute *attr,	\
 			   char *buf)						\
 {										\
-	return sysfs_emit(buf, "%llu\n", chan_of(dev)->stat.field);		\
+	struct hws_chan *c = chan_of(dev);					\
+										\
+	return sysfs_emit(buf, "%llu\n", hws_read_stat(c, &c->stat.field));	\
 }										\
 static DEVICE_ATTR_RO(name)
 
@@ -43,19 +57,25 @@ static ssize_t signal_show(struct device *dev, struct device_attribute *attr, ch
 {
 	struct hws_chan *c = chan_of(dev);
 	struct hws_input in;
-	u64 period = c->period_ns;
+	unsigned long flags;
+	bool streaming;
+	u64 period, mfps;
+	u32 frac;
 
+	spin_lock_irqsave(&c->event_lock, flags);
+	period = c->period_ns;
+	streaming = c->streaming;
+	spin_unlock_irqrestore(&c->event_lock, flags);
 	hws_read_input(c->card, c->index, &in);
 	if (!in.signal)
 		return sysfs_emit(buf, "no signal\n");
 	if (!period)
 		return sysfs_emit(buf, "%ux%u%s, measuring the rate%s\n", in.width, in.height,
 				  in.interlaced ? " interlaced" : "", in.hdcp ? ", HDCP" : "");
-	return sysfs_emit(buf, "%ux%u%s %llu.%03llu fps%s%s\n", in.width, in.height,
-			  in.interlaced ? " interlaced" : "",
-			  div64_u64(NSEC_PER_SEC, period),
-			  div64_u64(NSEC_PER_SEC * 1000ULL, period) % 1000,
-			  in.hdcp ? ", HDCP" : "", c->streaming ? " capturing" : "");
+	mfps = div_u64_rem(div64_u64(NSEC_PER_SEC * 1000ULL, period), 1000, &frac);
+	return sysfs_emit(buf, "%ux%u%s %llu.%03u fps%s%s\n", in.width, in.height,
+			  in.interlaced ? " interlaced" : "", mfps, frac,
+			  in.hdcp ? ", HDCP" : "", streaming ? " capturing" : "");
 }
 static DEVICE_ATTR_RO(signal);
 
@@ -88,12 +108,11 @@ static const struct attribute_group hws_node_group = {
 	.attrs = hws_node_attrs,
 };
 
-int hws_sysfs_add(struct hws_chan *c)
-{
-	return sysfs_create_group(&c->vdev.dev.kobj, &hws_node_group);
-}
-
-void hws_sysfs_remove(struct hws_chan *c)
-{
-	sysfs_remove_group(&c->vdev.dev.kobj, &hws_node_group);
-}
+/*
+ * Given to the node's device before it is registered, so that the files are
+ * there when udev hears of the node, and go with the device.
+ */
+const struct attribute_group *hws_node_groups[] = {
+	&hws_node_group,
+	NULL,
+};

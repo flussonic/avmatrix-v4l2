@@ -20,6 +20,32 @@
  * measured by its field and delivered woven, and a raster larger than the
  * scaler's output comes scaled down to it.
  */
+/*
+ * What the capture takes: CEA-861 and DMT rasters up to the scaler's output.
+ * The pixel clock floor is that of a bare frame (hws_timings_for()) of the
+ * smallest raster at the lowest rate, no blanking counted.
+ */
+const struct v4l2_dv_timings_cap hws_timings_cap = {
+	.type = V4L2_DV_BT_656_1120,
+	.bt = {
+		.min_width = 640,
+		.max_width = HWS_MAX_WIDTH,
+		.min_height = 480,
+		.max_height = HWS_MAX_HEIGHT,
+		.min_pixelclock = 5000000,
+		.max_pixelclock = 600000000,
+		.standards = V4L2_DV_BT_STD_CEA861 | V4L2_DV_BT_STD_DMT,
+		.capabilities = V4L2_DV_BT_CAP_INTERLACED | V4L2_DV_BT_CAP_PROGRESSIVE,
+	},
+};
+
+/*
+ * The frame of an input as the card delivers it: an interlaced input is
+ * measured by its field and delivered woven, and a raster larger than the
+ * scaler's output comes scaled down to it. A raster below what the capture
+ * takes, or of an odd width, is no frame (0x0): the card reports such while
+ * it is still locking.
+ */
 void hws_frame_of_input(const struct hws_input *in, u32 *w, u32 *h, bool *interlaced)
 {
 	*w = in->width;
@@ -28,6 +54,10 @@ void hws_frame_of_input(const struct hws_input *in, u32 *w, u32 *h, bool *interl
 	if (*w > HWS_MAX_WIDTH || *h > HWS_MAX_HEIGHT) {
 		*w = HWS_MAX_WIDTH;
 		*h = HWS_MAX_HEIGHT;
+	}
+	if (*w < hws_timings_cap.bt.min_width || *h < hws_timings_cap.bt.min_height || (*w & 1)) {
+		*w = 0;
+		*h = 0;
 	}
 }
 
@@ -63,14 +93,20 @@ u64 hws_snap_period(u64 measured_ns, bool *known)
 	return *known ? best : measured_ns;
 }
 
+/*
+ * The frame totals are summed in 64 bits: the fields come from the client,
+ * and their sum in 32 bits can wrap. Totals past 16 bits are no raster.
+ */
 static u64 hws_bt_period(const struct v4l2_bt_timings *bt)
 {
-	u64 tot = (u64)V4L2_DV_BT_FRAME_WIDTH(bt) * V4L2_DV_BT_FRAME_HEIGHT(bt);
+	u64 fw = (u64)bt->width + bt->hfrontporch + bt->hsync + bt->hbackporch;
+	u64 fh = (u64)bt->height + bt->vfrontporch + bt->vsync + bt->vbackporch +
+		 bt->il_vfrontporch + bt->il_vsync + bt->il_vbackporch;
 	u64 p;
 
-	if (!tot || !bt->pixelclock)
+	if (!fw || !fh || fw > U16_MAX || fh > U16_MAX || !bt->pixelclock)
 		return 0;
-	p = div64_u64(tot * NSEC_PER_SEC, bt->pixelclock);
+	p = div64_u64(fw * fh * NSEC_PER_SEC, bt->pixelclock);
 	if (bt->flags & V4L2_DV_FL_REDUCED_FPS)
 		p = div_u64(p * 1001, 1000);
 	return p;
@@ -132,9 +168,9 @@ void hws_timings_for(u32 width, u32 height, bool interlaced, u64 period_ns,
 	t->bt.standards = 0;
 }
 
+/* Timings a client may set: within the cap, an even width (a line is whole words), a period. */
 bool hws_timings_fit(const struct v4l2_dv_timings *t)
 {
-	return t->type == V4L2_DV_BT_656_1120 && t->bt.width && t->bt.height &&
-	       t->bt.width <= HWS_MAX_WIDTH && t->bt.height <= HWS_MAX_HEIGHT &&
+	return v4l2_valid_dv_timings(t, &hws_timings_cap, NULL, NULL) && !(t->bt.width & 1) &&
 	       hws_bt_period(&t->bt);
 }
