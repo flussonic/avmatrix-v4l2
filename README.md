@@ -9,7 +9,10 @@ them and in the client. So a program that captures from a DeckLink, a KONA
 or a DekTec card captures from an HWS input with the same code; the
 streamer's SDI input takes these nodes as they are. The vendor block
 declared in `include/hwav.h` carries what only this card tells: the raster
-the input arrived in, the card's own frame rate count, HDCP.
+the input arrived in and, on boards past version 121, the card's own frame
+rate count and HDCP. What HDMI carries beyond picture and stereo sound --
+InfoFrames, HDR, the audio format, CEC -- the card does not pass on
+(`docs/hardware.md`).
 
 The module is ours, written against the card's registers. What those
 registers are and how the card has to be started comes from the driver of
@@ -124,7 +127,8 @@ bridge's interrupt enables are set, and most of them never reach the host
 as interrupts, on the legacy line and over MSI alike: a 59.94 Hz input gave
 25 to 40 interrupts a second. With the enables clear the bits latch, and
 the driver reads them every 250 us while an input captures (`poll_us`
-module parameter). The engine skips a frame whose predecessor's bit is still
+module parameter, 50 to 300: at 500 the card already loses a frame in ten).
+The engine skips a frame whose predecessor's bit is still
 up when it starts, so the poll is kept well inside the frame gap.
 
 The engine writes each line of a frame to its buffer register's address
@@ -140,7 +144,7 @@ is still half a frame away from overwriting it.
 
 ## State
 
-Brought up on an HWS X4 HDMI (8888:8504, board version 255.121) under
+Brought up on an HWS X4 HDMI (8888:8504, board version 121.0) under
 Ubuntu 24.04 with kernel 6.14, with a Roku player on input 3 sending
 1080p59.94: the rate detected as 59.94, capture through MMAP and USERPTR in
 UYVY and YUYV, 600-frame runs without a gap, a lost event or a split frame
@@ -149,6 +153,14 @@ device and all four nodes without a failure or a warning (the streaming
 part, `-s`, stops at the empty ANC and VBI planes, whose `bytesused` of 0 is
 what the contract asks for). The streamer's SDI input captured it for
 minutes as H.264 and AAC without a frame lost.
+
+Under a debug kernel (6.14 with KASAN, lockdep, kmemleak, UBSAN bounds and
+DMA API checks): five minutes of capture without a frame lost or a split
+line unresolved, start/stop on all four nodes at once, timings refused
+below 640x480 or of an odd width, the engine stopped under the watchdog
+while STREAMOFF comes and goes, unbind and bind while idle and while
+capturing, unbind with a node held open and closed afterwards -- no report,
+no leak.
 
 Not verified: interlaced inputs (the raster the card reports for them is
 taken as one field and the frame as woven -- no source of ours sends one to
@@ -163,7 +175,8 @@ The names next to a node, their meaning and the rule for a counter the card
 cannot report are the contract in `docs/sdi-sysfs.md`, shared with our SDI
 drivers. A node carries `frames`, `frames_skipped`, `no_buffer`, `no_sync`,
 `resyncs`, `events_missed`, `dma_errors`, `restarts` and `signal`, and one of
-its own, `hdcp`. `resyncs` counts frames given up because the poll moved the
+its own, `hdcp`, on boards past version 121 (the earlier ones do not report
+it). `resyncs` counts frames given up because the poll moved the
 register too late, `dma_errors` frames that did not arrive whole -- the
 next frame reached the copy, or the split could not be placed. The card
 counts no line CRCs, so there is no `crc_errors`.

@@ -13,7 +13,8 @@
 #define HWAV_VENDOR_MAGIC	v4l2_fourcc('H', 'W', 'A', 'V')	/* an AVMatrix HWS card */
 #define HWAV_VENDOR_VERSION	1
 
-#define HWAV_F_HDCP		(1u << 0) /* the input is HDCP protected; the card delivers no picture */
+#define HWAV_F_HDCP		(1u << 0) /* the input is HDCP protected; the card delivers no picture
+					   * (boards up to version 121 do not report it) */
 #define HWAV_F_SCALED		(1u << 1) /* the input raster is not the frame's: the card scaled it */
 
 /* Vendor block of an HWS card: right after the common part. */

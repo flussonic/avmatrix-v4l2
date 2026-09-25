@@ -71,7 +71,10 @@
 #define HWS_REG_ABUF_TOGGLE(ch)		HWS_CORE_REG(40 + (ch))
 #define HWS_REG_VBUF_TOGGLE(ch)		HWS_CORE_REG(32 + (ch))
 
-/* Board version: bits 7..0 version, 15..8 sub-version. */
+/*
+ * Board version: bits 15..8 version, 23..16 sub-version, 25..24 port id,
+ * 31..28 YV12 support -- as the vendor's driver reads it.
+ */
 #define HWS_REG_DEVICE_INFO		HWS_CORE_REG(88)
 
 /* Input raster as measured: width in bits 15..0, height 31..16. */

@@ -66,7 +66,10 @@ struct hws_slot {
 	void *cpu;
 	dma_addr_t dma;
 	unsigned int users;	/* the register, and frames with a part in it */
-	u32 band_lo, band_hi;	/* lines marked whole when it was handed out */
+	u32 mark_at;		/* the line the markers were laid out around */
+	u32 band_lo, band_hi;	/* lines marked whole around it */
+	bool ready;		/* marked, and not handed out since */
+	bool marking;		/* being marked outside the poll */
 };
 
 /* A frame as it lies in the slots. */
@@ -204,11 +207,24 @@ struct hws_card {
 	unsigned int naudio;		/* of those with audio */
 	u32 device_ver;
 	u32 sub_ver;
+	/*
+	 * The later register set: the input frame rate, the HDCP bits and the
+	 * transfer limit. Boards up to version 121 read those words as zero.
+	 */
+	bool regs_v1;
 	spinlock_t reg_lock;		/* read-modify-write of shared registers */
+	struct mutex start_lock;	/* starting the core again while channels run */
 	struct hws_chan *ch[HWS_MAX_CHANNELS];
 	struct v4l2_device v4l2_dev;
 	struct media_device mdev;
 	struct delayed_work monitor;
+	/*
+	 * Where the channels copy their frames: unbound, so that two channels
+	 * copy on two CPUs at once rather than one after the other on the CPU
+	 * the poll ran on -- each copy has half a frame before the next frame
+	 * reaches it.
+	 */
+	struct workqueue_struct *wq;
 	struct hrtimer poll_timer;
 	struct mutex poll_lock;
 	unsigned int poll_users;	/* engines running; the poll runs while any does */
@@ -234,12 +250,14 @@ void hws_poll_put(struct hws_card *card);
 int hws_card_start(struct hws_card *card);
 void hws_card_stop(struct hws_card *card);
 int hws_card_check(struct hws_card *card);
+void hws_restore_channels(struct hws_card *card);
 void hws_set_bits(struct hws_card *card, u32 reg, u32 bits, bool on);
 void hws_read_input(struct hws_card *card, unsigned int ch, struct hws_input *in);
 void hws_program_window(struct hws_chan *c, dma_addr_t dma, u32 reg);
 void hws_apply_bchs(struct hws_chan *c);
 
 /* Timings, hwsv4l2_timings.c. */
+extern const struct v4l2_dv_timings_cap hws_timings_cap;
 void hws_frame_of_input(const struct hws_input *in, u32 *w, u32 *h, bool *interlaced);
 u64 hws_snap_period(u64 measured_ns, bool *known);
 void hws_timings_for(u32 width, u32 height, bool interlaced, u64 period_ns,
@@ -264,8 +282,7 @@ void hws_audio_stop(struct hws_chan *c);
 bool hws_audio_ready(struct hws_chan *c, u64 ts, u64 now_ns);
 unsigned int hws_audio_take(struct hws_chan *c, u64 ts, void *plane, size_t bytes);
 
-/* Counters in sysfs, hwsv4l2_sysfs.c. */
-int hws_sysfs_add(struct hws_chan *c);
-void hws_sysfs_remove(struct hws_chan *c);
+/* Counters in sysfs, hwsv4l2_sysfs.c: the attribute groups of a node. */
+extern const struct attribute_group *hws_node_groups[];
 
 #endif

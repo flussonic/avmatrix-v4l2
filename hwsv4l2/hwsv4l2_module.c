@@ -7,7 +7,7 @@
  * input becomes a capture node (see include/sdi_av.h for the buffer
  * layout); the card is a media device with the connectors as entities.
  * Nothing on the card is interrupt driven: the frame and audio events are
- * polled at 2 kHz while an engine runs (hws_poll_card() says why), and a
+ * polled at 4 kHz while an engine runs (hws_poll_card() says why), and a
  * monitor reads the inputs five times a second, since the card tells
  * nothing when a signal comes or goes.
  *
@@ -23,11 +23,14 @@
 #include "hwsv4l2.h"
 
 #define HWS_MONITOR_PERIOD	msecs_to_jiffies(200)
-/* How often the status word is read while an engine runs. */
+/*
+ * How often the status word is read while an engine runs. Past 300 us the
+ * card starts losing frames (hws_poll_card()), so that is the ceiling.
+ */
 static unsigned int hws_poll_us = 250;
 module_param_named(poll_us, hws_poll_us, uint, 0644);
-MODULE_PARM_DESC(poll_us, "Status poll period in microseconds while capturing (default 250)");
-#define HWS_POLL_NS		((u64)clamp(hws_poll_us, 50u, 1000u) * NSEC_PER_USEC)
+MODULE_PARM_DESC(poll_us, "Status poll period in microseconds while capturing, 50 to 300 (default 250)");
+#define HWS_POLL_NS		((u64)clamp(hws_poll_us, 50u, 300u) * NSEC_PER_USEC)
 
 struct hws_model {
 	u16 device;
@@ -113,13 +116,18 @@ static void hws_poll_card(struct hws_card *card, u64 now)
 		if (!c)
 			continue;
 		spin_lock(&c->event_lock);
-		hws_video_poll(c, now);
+		/*
+		 * The done event first: a register move that came due in the same
+		 * interval is late for the frame just done, which is then given up
+		 * rather than taken from a slot the next frame is already filling.
+		 */
 		if (status & HWS_INT_VDONE(i))
 			hws_video_done(c, at);
+		hws_video_poll(c, now);
 		if (status & HWS_INT_ADONE(i)) {
 			hws_audio_done(c, at);
-			if (!list_empty(&c->waiting))
-				schedule_work(&c->done_work);
+			if (c->streaming && !list_empty(&c->waiting))
+				queue_work(card->wq, &c->done_work);
 		}
 		spin_unlock(&c->event_lock);
 	}
@@ -201,6 +209,44 @@ static void hws_free_channels(struct hws_card *card)
 	}
 }
 
+/*
+ * The last reference to the card is gone: every node has been closed by
+ * everyone who had it open, so the structures a file handle reaches -- the
+ * queue lock, the controls, the v4l2 and media devices -- can go.
+ */
+static void hws_card_release(struct v4l2_device *v4l2_dev)
+{
+	struct hws_card *card = container_of(v4l2_dev, struct hws_card, v4l2_dev);
+	unsigned int i;
+
+	for (i = 0; i < card->nch; i++) {
+		if (!card->ch[i])
+			continue;
+		v4l2_ctrl_handler_free(&card->ch[i]->ctrl_handler);
+		kfree(card->ch[i]);
+	}
+	media_device_cleanup(&card->mdev);
+	destroy_workqueue(card->wq);
+	kfree(card);
+}
+
+/*
+ * The engines stop and the card lets go of the bus before the memory they
+ * write is freed; the poll stops with them, since it reads the channels.
+ */
+static void hws_card_teardown(struct hws_card *card)
+{
+	unsigned int i;
+
+	WARN_ON(card->poll_users);
+	hrtimer_cancel(&card->poll_timer);
+	hws_card_stop(card);
+	pci_clear_master(card->pdev);
+	for (i = 0; i < card->nch; i++)
+		if (card->ch[i])
+			hws_chan_free(card->ch[i]);
+}
+
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	const struct hws_model *model = hws_model_of(pdev->device);
@@ -210,7 +256,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	if (!model)
 		return -ENODEV;
-	card = devm_kzalloc(&pdev->dev, sizeof(*card), GFP_KERNEL);
+	/* Not devres: a node held open outlives the device (hws_card_release()). */
+	card = kzalloc(sizeof(*card), GFP_KERNEL);
 	if (!card)
 		return -ENOMEM;
 	card->pdev = pdev;
@@ -220,6 +267,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	card->nch = model->inputs;
 	card->naudio = model->audio;
 	spin_lock_init(&card->reg_lock);
+	mutex_init(&card->start_lock);
 	mutex_init(&card->poll_lock);
 	INIT_DELAYED_WORK(&card->monitor, hws_monitor);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
@@ -228,20 +276,26 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hrtimer_init(&card->poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	card->poll_timer.function = hws_poll_fn;
 #endif
+	card->v4l2_dev.release = hws_card_release;
 	pci_set_drvdata(pdev, card);
+	card->wq = alloc_workqueue("hwsv4l2-%s", WQ_UNBOUND | WQ_HIGHPRI, 0, pci_name(pdev));
+	if (!card->wq) {
+		ret = -ENOMEM;
+		goto err_card;
+	}
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
-		return ret;
+		goto err_card;
 	pci_set_master(pdev);
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (ret)
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret)
-		return ret;
+		goto err_card;
 	ret = pcim_iomap_regions(pdev, BIT(0), HWS_DRV_NAME);
 	if (ret)
-		return ret;
+		goto err_card;
 	card->bar0 = pcim_iomap_table(pdev)[0];
 	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
 
@@ -269,6 +323,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = v4l2_device_register(&pdev->dev, &card->v4l2_dev);
 	if (ret)
 		goto err_media;
+	/* From here on the card goes with its last reference. */
 
 	for (i = 0; i < card->nch; i++) {
 		ret = hws_video_register(card->ch[i]);
@@ -286,12 +341,20 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 err_nodes:
 	while (i--)
 		hws_video_unregister(card->ch[i]);
+	hws_card_teardown(card);
 	v4l2_device_unregister(&card->v4l2_dev);
+	v4l2_device_put(&card->v4l2_dev);
+	return ret;
 err_media:
 	media_device_cleanup(&card->mdev);
 	hws_card_stop(card);
 err_channels:
+	pci_clear_master(pdev);
 	hws_free_channels(card);
+err_card:
+	if (card->wq)
+		destroy_workqueue(card->wq);
+	kfree(card);
 	return ret;
 }
 
@@ -305,10 +368,9 @@ static void hws_remove(struct pci_dev *pdev)
 		media_device_unregister(&card->mdev);
 	for (i = 0; i < card->nch; i++)
 		hws_video_unregister(card->ch[i]);
-	hws_card_stop(card);
+	hws_card_teardown(card);
 	v4l2_device_unregister(&card->v4l2_dev);
-	media_device_cleanup(&card->mdev);
-	hws_free_channels(card);
+	v4l2_device_put(&card->v4l2_dev);
 }
 
 static void hws_shutdown(struct pci_dev *pdev)
@@ -317,7 +379,38 @@ static void hws_shutdown(struct pci_dev *pdev)
 
 	cancel_delayed_work_sync(&card->monitor);
 	hws_card_stop(card);
+	pci_clear_master(pdev);
 }
+
+/*
+ * Across a suspend the core loses its state. On resume it is started as at
+ * probe, and the channels that were capturing get their registers back; a
+ * rate measurement that was running times out and is taken again.
+ */
+static int hws_suspend(struct device *dev)
+{
+	struct hws_card *card = dev_get_drvdata(dev);
+
+	cancel_delayed_work_sync(&card->monitor);
+	hws_card_stop(card);
+	return 0;
+}
+
+static int hws_resume(struct device *dev)
+{
+	struct hws_card *card = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&card->start_lock);
+	ret = hws_card_start(card);
+	if (!ret)
+		hws_restore_channels(card);
+	mutex_unlock(&card->start_lock);
+	schedule_delayed_work(&card->monitor, 0);
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(hws_pm_ops, hws_suspend, hws_resume);
 
 static struct pci_driver hws_pci_driver = {
 	.name = HWS_DRV_NAME,
@@ -325,6 +418,7 @@ static struct pci_driver hws_pci_driver = {
 	.probe = hws_probe,
 	.remove = hws_remove,
 	.shutdown = hws_shutdown,
+	.driver.pm = pm_sleep_ptr(&hws_pm_ops),
 };
 module_pci_driver(hws_pci_driver);
 

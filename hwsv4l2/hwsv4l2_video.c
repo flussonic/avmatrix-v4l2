@@ -2,18 +2,22 @@
 /*
  * The V4L2 capture node of one HWS input.
  *
- * Frame flow. The engine of a channel writes each frame to the address in
- * its buffer register, taken when the frame starts, and raises a done event
- * at the end of it. The register gets the slot of the next frame in the
- * middle of the current one (hws_slot_arm()), and where a frame actually
- * landed is read from the slots themselves: each carries a marker at both
- * ends of the frame when it is handed out, the slot whose end marker the DMA
- * overwrote holds the frame, and one whose start marker survived did not get
- * all of it. A work item then copies the frame from the
- * slot into the client's buffer (the engine cannot scatter, so the buffers
- * are plain vmalloc memory), turning YUYV into UYVY on the way when that is
- * the format, and lets the buffer wait for the first audio packet past the
- * frame (hwsv4l2_audio.c) before it hands it out.
+ * Frame flow. The engine of a channel writes each frame line by line to the
+ * address in its buffer register, reading the register as it goes, and
+ * raises a done event at the end of the frame. The next frame starts tens of
+ * microseconds later, too soon to move the register between frames, so the
+ * poll moves it to a fresh slot in the middle of every frame
+ * (hws_slot_arm()): a frame lies in two slots, its top in the slot it started
+ * in and its bottom in the next. Every slot handed out carries a marker at
+ * the start of each line and in every word of a band of lines around where
+ * the frame is expected to cross into it; at the done event the crossing is
+ * the first line of the bottom slot whose marker the DMA overwrote, counting
+ * up from the bottom, and a line the move cut in two is resolved word by
+ * word inside the band. A work item copies the two parts into the client's
+ * buffer (the engine cannot scatter, so the buffers are plain vmalloc
+ * memory), turning YUYV into UYVY on the way when that is the format, and
+ * lets the buffer wait for the first audio packet past the frame
+ * (hwsv4l2_audio.c) before it hands it out.
  *
  * The frame rate the card reports is a whole number; the driver measures
  * the period itself from the done events. Until it has (two seconds of
@@ -154,6 +158,7 @@ static void hws_slot_mark(struct hws_chan *c, struct hws_slot *s, u32 at)
 {
 	u32 y, words = c->row_bytes / 4;
 
+	s->mark_at = at;
 	s->band_lo = at > HWS_BAND_BEFORE ? at - HWS_BAND_BEFORE : 0;
 	s->band_hi = min(at + HWS_BAND_AFTER, c->height);
 	for (y = 0; y < c->height; y++) {
@@ -213,29 +218,61 @@ static bool hws_drop_oldest(struct hws_chan *c)
 }
 
 /*
+ * Whether a slot marked ahead of time serves a crossing at line `at`: the
+ * band reaches HWS_BAND_BEFORE lines above the line it was laid out around
+ * and HWS_BAND_AFTER below, and a crossing a little off that line still
+ * falls well inside it.
+ */
+static bool hws_slot_fits(const struct hws_slot *s, u32 at)
+{
+	return s->ready && at + HWS_BAND_BEFORE / 2 >= s->mark_at &&
+	       at <= s->mark_at + HWS_BAND_AFTER / 2;
+}
+
+/* A free slot, one marked for this crossing if there is one. */
+static struct hws_slot *hws_free_slot(struct hws_chan *c, u32 at)
+{
+	struct hws_slot *any = NULL;
+	unsigned int i;
+
+	for (i = 0; i < HWS_NUM_SLOTS; i++) {
+		struct hws_slot *s = &c->slots[i];
+
+		if (s->users || s->marking)
+			continue;
+		if (hws_slot_fits(s, at))
+			return s;
+		if (!any)
+			any = s;
+	}
+	return any;
+}
+
+/*
  * Move the buffer register to a fresh slot in the middle of the frame the
  * engine is writing: its lines from here on go to the new slot, and so does
- * the top of the next frame. Caller holds event_lock.
+ * the top of the next frame. The slot is normally marked already
+ * (hws_video_premark()); one that is not, or not for this line, is marked
+ * here. Caller holds event_lock.
  */
 static void hws_slot_arm(struct hws_chan *c, u64 now_ns)
 {
-	struct hws_slot *pick = NULL;
+	struct hws_slot *pick;
 	u32 at = c->height;
-	unsigned int i;
 
+	if (c->cur.top && c->period_ns && c->last_done_ns && now_ns > c->last_done_ns)
+		at = min_t(u64, div64_u64((now_ns - c->last_done_ns) * c->height, c->period_ns),
+			   c->height);
 	for (;;) {
-		for (i = 0; i < HWS_NUM_SLOTS && !pick; i++)
-			if (!c->slots[i].users)
-				pick = &c->slots[i];
+		pick = hws_free_slot(c, at);
 		if (pick || !hws_drop_oldest(c))
 			break;
 	}
 	if (!pick)
 		return;
-	if (c->cur.top && c->period_ns && c->last_done_ns && now_ns > c->last_done_ns)
-		at = min_t(u64, div64_u64((now_ns - c->last_done_ns) * c->height, c->period_ns),
-			   c->height);
-	hws_slot_mark(c, pick, at);
+	if (!hws_slot_fits(pick, at))
+		hws_slot_mark(c, pick, at);
+	pick->ready = false;
 	pick->users++;			/* the register */
 	/* The markers are in memory before the engine may write the slot. */
 	wmb();
@@ -257,15 +294,61 @@ void hws_video_poll(struct hws_chan *c, u64 now_ns)
 	}
 }
 
-static void hws_slots_reset(struct hws_chan *c)
+/*
+ * Mark the free slots ahead of time, in process context: marking is a pass
+ * over every line of a slot and a whole band, which the poll's hardirq
+ * should not carry. The band is laid out around the line the frame crosses
+ * at when the poll is on time, halfway down once the period is known.
+ */
+static void hws_video_premark(struct hws_chan *c)
 {
+	unsigned long flags;
 	unsigned int i;
 
-	for (i = 0; i < HWS_NUM_SLOTS; i++)
+	for (i = 0; i < HWS_NUM_SLOTS; i++) {
+		struct hws_slot *s = &c->slots[i];
+		u32 at;
+
+		spin_lock_irqsave(&c->event_lock, flags);
+		if (!c->streaming || s->users || s->marking || s->ready) {
+			spin_unlock_irqrestore(&c->event_lock, flags);
+			continue;
+		}
+		s->marking = true;
+		at = c->period_ns ? c->height / 2 : c->height;
+		spin_unlock_irqrestore(&c->event_lock, flags);
+
+		hws_slot_mark(c, s, at);
+
+		spin_lock_irqsave(&c->event_lock, flags);
+		s->marking = false;
+		s->ready = true;
+		spin_unlock_irqrestore(&c->event_lock, flags);
+	}
+}
+
+/*
+ * Every slot free again, the frames waiting for their copy given up -- all
+ * but one the work item is copying now, which keeps its slots until the
+ * copy is over. Caller holds event_lock.
+ */
+static void hws_slots_reset(struct hws_chan *c)
+{
+	bool keep = c->nframes && c->frames[0].copying;
+	unsigned int i;
+
+	for (i = 0; i < HWS_NUM_SLOTS; i++) {
 		c->slots[i].users = 0;
+		c->slots[i].ready = false;
+	}
 	c->base = NULL;
 	memset(&c->cur, 0, sizeof(c->cur));
 	c->nframes = 0;
+	if (keep) {
+		c->nframes = 1;
+		c->frames[0].top->users++;
+		c->frames[0].bottom->users++;
+	}
 }
 
 /* ---- capture engine -------------------------------------------------- */
@@ -274,10 +357,12 @@ static void hws_vcap_start(struct hws_chan *c)
 {
 	struct hws_card *card = c->card;
 	unsigned long flags;
+	bool was_on;
 
 	hws_wr(card, HWS_REG_OUT_RES(c->index), c->height << 16 | c->width);
 	hws_wr(card, HWS_REG_VHALF(c->index), c->frame_bytes / 2 / 16);
 	spin_lock_irqsave(&c->event_lock, flags);
+	was_on = c->vcap_on;
 	hws_slots_reset(c);
 	/* The frame running now is joined halfway; the first whole one follows it. */
 	hws_slot_arm(c, 0);
@@ -288,7 +373,9 @@ static void hws_vcap_start(struct hws_chan *c)
 	spin_unlock_irqrestore(&c->event_lock, flags);
 	hws_wr(card, HWS_REG_INT_STATUS, HWS_INT_VDONE(c->index));
 	hws_set_bits(card, HWS_REG_VCAP_ENABLE, BIT(c->index), true);
-	hws_poll_get(card);
+	/* One hold on the poll per running engine, however often it is started. */
+	if (!was_on)
+		hws_poll_get(card);
 }
 
 static void hws_vcap_stop(struct hws_chan *c)
@@ -312,10 +399,13 @@ static void hws_vcap_stop(struct hws_chan *c)
  */
 static void hws_measure(struct hws_chan *c, u64 now_ns)
 {
-	u64 measured, period;
+	u64 measured, period, gap = c->period_ns;
 	bool known;
 
-	if (c->m_frames && c->period_ns && now_ns - c->m_last_ns > c->period_ns * 3 / 2)
+	/* Before the period is known the gap is judged by the running estimate. */
+	if (!gap && c->m_frames > 1)
+		gap = div_u64(c->m_last_ns - c->m_first_ns, c->m_frames - 1);
+	if (c->m_frames && gap && (s64)(now_ns - c->m_last_ns) > (s64)(gap * 3 / 2))
 		c->m_frames = 0;
 	if (!c->m_frames) {
 		c->m_first_ns = now_ns;
@@ -361,8 +451,9 @@ void hws_video_done(struct hws_chan *c, u64 now_ns)
 	if (!c->vcap_on)
 		return;
 
+	/* Signed: the watchdog dates its restart from a clock read of its own. */
 	if (c->streaming && c->last_done_ns && c->period_ns &&
-	    now_ns - c->last_done_ns > c->period_ns * 3 / 2) {
+	    (s64)(now_ns - c->last_done_ns) > (s64)(c->period_ns * 3 / 2)) {
 		u32 missed = div64_u64(now_ns - c->last_done_ns + c->period_ns / 2, c->period_ns) - 1;
 
 		c->stat.events_missed += missed;
@@ -396,7 +487,7 @@ void hws_video_done(struct hws_chan *c, u64 now_ns)
 		} else {
 			c->frames[c->nframes++] = *f;
 		}
-		schedule_work(&c->done_work);
+		queue_work(c->card->wq, &c->done_work);
 	} else if (f->top) {
 		hws_slot_put(f->top);
 		c->stat.resyncs++;
@@ -434,10 +525,13 @@ static void hws_copy_words(struct hws_chan *c, struct hws_slot *slot, u32 y, u32
 	}
 	for (; i < to && (i & 1); i++)
 		d[i] = ((s[i] & 0x00ff00ff) << 8) | ((s[i] >> 8) & 0x00ff00ff);
+	/* Eight bytes at a time; memcpy, since a line of 4n+2 pixels leaves them unaligned. */
 	for (; i + 2 <= to; i += 2) {
-		u64 v = *(const u64 *)(s + i);
+		u64 v;
 
-		*(u64 *)(d + i) = ((v & 0x00ff00ff00ff00ffULL) << 8) | ((v >> 8) & 0x00ff00ff00ff00ffULL);
+		memcpy(&v, s + i, sizeof(v));
+		v = ((v & 0x00ff00ff00ff00ffULL) << 8) | ((v >> 8) & 0x00ff00ff00ff00ffULL);
+		memcpy(d + i, &v, sizeof(v));
 	}
 	for (; i < to; i++)
 		d[i] = ((s[i] & 0x00ff00ff) << 8) | ((s[i] >> 8) & 0x00ff00ff);
@@ -553,6 +647,8 @@ static void hws_done_work(struct work_struct *w)
 		hws_copy_lines(c, f.bottom, f.cut, c->height, dst);
 		if (f.split_word)
 			hws_copy_words(c, f.bottom, f.cut - 1, f.split_word, c->row_bytes / 4, dst);
+		/* The copy is read before the marker that says it was still whole. */
+		rmb();
 		bad = !f.cut || f.split_lost ||
 		      (f.cut < c->height && !hws_line_marked(c, f.bottom, f.cut - 1));
 		hws_copy_lines(c, f.top, 0, f.split_word ? f.cut - 1 : f.cut, dst);
@@ -583,7 +679,7 @@ static void hws_done_work(struct work_struct *w)
 		struct hws_buffer *buf;
 
 		spin_lock_irqsave(&c->event_lock, flags);
-		buf = list_first_entry_or_null(&c->waiting, struct hws_buffer, list);
+		buf = c->streaming ? list_first_entry_or_null(&c->waiting, struct hws_buffer, list) : NULL;
 		if (buf && hws_audio_ready(c, buf->ts, ktime_get_ns()))
 			list_del_init(&buf->list);
 		else
@@ -593,6 +689,7 @@ static void hws_done_work(struct work_struct *w)
 			break;
 		hws_finish_buffer(c, buf);
 	}
+	hws_video_premark(c);
 }
 
 /* ---- watchdog -------------------------------------------------------- */
@@ -602,35 +699,51 @@ static void hws_done_work(struct work_struct *w)
  * the engine when a signal is there and no frame has been done for half a
  * second.
  */
+/*
+ * Restart a stalled engine; caller holds the queue lock, so STREAMOFF is
+ * not halfway through. The frames waiting for their copy are given up
+ * (hws_slots_reset()).
+ */
+static void hws_restart(struct hws_chan *c)
+{
+	unsigned long flags;
+
+	dev_warn_ratelimited(&c->card->pdev->dev, "input %u: no frame done, capture restarted\n",
+			     c->index + 1);
+	hws_vcap_stop(c);
+	spin_lock_irqsave(&c->event_lock, flags);
+	c->stat.skipped += c->nframes - (c->nframes && c->frames[0].copying ? 1 : 0);
+	c->stat.restarts++;
+	spin_unlock_irqrestore(&c->event_lock, flags);
+	hws_vcap_start(c);
+	spin_lock_irqsave(&c->event_lock, flags);
+	c->last_done_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&c->event_lock, flags);
+}
+
 static void hws_watchdog(struct work_struct *w)
 {
 	struct hws_chan *c = container_of(to_delayed_work(w), struct hws_chan, watchdog);
-	u64 now = ktime_get_ns();
 	unsigned long flags;
-	bool restart = false;
+	bool streaming, stalled;
 
 	spin_lock_irqsave(&c->event_lock, flags);
-	if (!c->streaming) {
-		spin_unlock_irqrestore(&c->event_lock, flags);
-		return;
-	}
-	if (c->in.signal && c->last_done_ns && now - c->last_done_ns > HWS_STALL_NS) {
-		restart = true;
-		c->stat.restarts++;
-		c->last_done_ns = now;
-	}
+	streaming = c->streaming;
+	stalled = streaming && c->in.signal && c->last_done_ns &&
+		  (s64)(ktime_get_ns() - c->last_done_ns) > (s64)HWS_STALL_NS;
 	spin_unlock_irqrestore(&c->event_lock, flags);
-
-	if (restart) {
-		dev_warn_ratelimited(&c->card->pdev->dev, "input %u: no frame done, capture restarted\n",
-				     c->index + 1);
-		hws_vcap_stop(c);
-		hws_vcap_start(c);
-		spin_lock_irqsave(&c->event_lock, flags);
-		c->last_done_ns = now;
-		spin_unlock_irqrestore(&c->event_lock, flags);
+	if (!streaming)
+		return;
+	/*
+	 * STREAMOFF holds the queue lock while it cancels this work, so the lock
+	 * is only tried; a stall still there is seen again next period.
+	 */
+	if (stalled && mutex_trylock(&c->lock)) {
+		if (c->streaming)
+			hws_restart(c);
+		mutex_unlock(&c->lock);
 	}
-	schedule_work(&c->done_work);
+	queue_work(c->card->wq, &c->done_work);
 	schedule_delayed_work(&c->watchdog, HWS_WATCHDOG_PERIOD);
 }
 
@@ -797,6 +910,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	hws_audio_start(c);
 	hws_vcap_start(c);
+	hws_video_premark(c);
 	schedule_delayed_work(&c->watchdog, HWS_WATCHDOG_PERIOD);
 	dev_info(&c->card->pdev->dev, "input %u: capture %ux%u%c, period %llu ns, %p4cc\n",
 		 c->index + 1, c->width, c->height, c->interlaced ? 'i' : 'p',
@@ -825,7 +939,6 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		 c->index + 1, c->stat.frames, c->stat.skipped, c->stat.no_buffer, c->stat.no_sync,
 		 c->stat.resyncs, c->stat.events_missed, c->stat.dma_errors, c->stat.restarts, c->stat.vdone,
 		 c->stat.adone, c->stat.split_lines);
-
 }
 
 static const struct vb2_ops hws_vb2_ops = {
@@ -989,20 +1102,6 @@ static int hws_g_dv_timings(struct file *file, void *fh, struct v4l2_dv_timings 
 	*t = c->timings;
 	return 0;
 }
-
-static const struct v4l2_dv_timings_cap hws_timings_cap = {
-	.type = V4L2_DV_BT_656_1120,
-	.bt = {
-		.min_width = 640,
-		.max_width = HWS_MAX_WIDTH,
-		.min_height = 480,
-		.max_height = HWS_MAX_HEIGHT,
-		.min_pixelclock = 13500000,
-		.max_pixelclock = 600000000,
-		.standards = V4L2_DV_BT_STD_CEA861 | V4L2_DV_BT_STD_DMT,
-		.capabilities = V4L2_DV_BT_CAP_INTERLACED | V4L2_DV_BT_CAP_PROGRESSIVE,
-	},
-};
 
 static int hws_enum_dv_timings(struct file *file, void *fh, struct v4l2_enum_dv_timings *e)
 {
@@ -1221,6 +1320,7 @@ int hws_video_register(struct hws_chan *c)
 	INIT_WORK(&c->done_work, hws_done_work);
 	INIT_DELAYED_WORK(&c->watchdog, hws_watchdog);
 	c->pixfmt = SDI_PIX_FMT_UYVY;
+	c->probe_until = jiffies;
 	hws_timings_for(1920, 1080, false, NSEC_PER_SEC / 60, &c->timings);
 	hws_update_geometry(c);
 	hws_read_input(card, c->index, &c->in);
@@ -1257,7 +1357,9 @@ int hws_video_register(struct hws_chan *c)
 		 c->index + 1);
 	vdev->fops = &hws_fops;
 	vdev->ioctl_ops = &hws_ioctl_ops;
+	/* The card goes with its last node (hws_card_release()); the node itself is part of it. */
 	vdev->release = video_device_release_empty;
+	vdev->dev.groups = hws_node_groups;
 	vdev->lock = &c->lock;
 	vdev->queue = q;
 	vdev->v4l2_dev = &card->v4l2_dev;
@@ -1288,8 +1390,6 @@ int hws_video_register(struct hws_chan *c)
 				    MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE);
 	if (ret)
 		dev_warn(&card->pdev->dev, "input %u: no media link (%d)\n", c->index + 1, ret);
-	if (hws_sysfs_add(c))
-		dev_warn(&card->pdev->dev, "input %u: no sysfs counters\n", c->index + 1);
 	dev_info(&card->pdev->dev, "input %u: %s, %s\n", c->index + 1,
 		 video_device_node_name(vdev), c->in.signal ? "signal" : "no signal");
 	return 0;
@@ -1314,9 +1414,8 @@ void hws_video_unregister(struct hws_chan *c)
 		c->probing = false;
 	}
 	mutex_unlock(&c->lock);
-	hws_sysfs_remove(c);
 	vb2_video_unregister_device(&c->vdev);
 	media_device_unregister_entity(&c->connector);
 	media_entity_cleanup(&c->connector);
-	v4l2_ctrl_handler_free(&c->ctrl_handler);
+	/* The controls stay until the last file handle, which may hold events of them, is closed. */
 }

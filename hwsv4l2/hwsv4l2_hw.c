@@ -63,19 +63,21 @@ static int hws_wait_idle(struct hws_card *card)
 int hws_card_start(struct hws_card *card)
 {
 	struct pci_dev *pdev = card->pdev;
+	unsigned long flags;
 	unsigned int i;
 	u32 info;
 
 	info = hws_rd(card, HWS_REG_DEVICE_INFO);
 	if (info == 0xffffffff)
 		return -ENODEV;
-	card->device_ver = info & 0xff;
-	card->sub_ver = (info >> 8) & 0xff;
+	card->device_ver = (info >> 8) & 0xff;
+	card->sub_ver = (info >> 16) & 0xff;
+	/* Past version 121, the one-input 122 excepted, as the vendor's driver has it. */
+	card->regs_v1 = card->device_ver > 121 && !(pdev->device == 0x8501 && card->device_ver == 122);
 
 	hws_wr(card, HWS_REG_DEC_MODE, 0);
 	hws_wr(card, HWS_REG_DEC_MODE, HWS_DEC_MODE_STOP);
-	/* Boards past version 121 need the transfer limit; the one-input 122 does not. */
-	if (card->device_ver > 121 && !(pdev->device == 0x8501 && card->device_ver == 122)) {
+	if (card->regs_v1) {
 		hws_wr(card, HWS_REG_DMA_MAX, HWS_MAX_WIDTH * HWS_MAX_HEIGHT * 2 / 16);
 		hws_rd(card, HWS_REG_DMA_MAX);
 	}
@@ -84,8 +86,10 @@ int hws_card_start(struct hws_card *card)
 	for (i = 0; i < card->nch; i++)
 		if (card->ch[i])
 			hws_seed_channel(card->ch[i]);
+	spin_lock_irqsave(&card->reg_lock, flags);
 	hws_wr(card, HWS_REG_VCAP_ENABLE, 0);
 	hws_wr(card, HWS_REG_ACAP_ENABLE, 0);
+	spin_unlock_irqrestore(&card->reg_lock, flags);
 
 	hws_wr(card, HWS_REG_DEC_MODE, HWS_DEC_MODE_START);
 	hws_wr(card, HWS_REG_DEC_MODE, HWS_DEC_MODE_START_ALL);
@@ -119,33 +123,80 @@ void hws_card_stop(struct hws_card *card)
 }
 
 /*
+ * A channel capturing when the core was started again gets back what the
+ * start sequence took from it: its slot in the buffer register, its frame
+ * size, its audio window and its enable bits. A rate measurement is not
+ * restored; it times out and is taken again.
+ */
+static void hws_restore_channel(struct hws_chan *c)
+{
+	struct hws_card *card = c->card;
+	unsigned long flags;
+	bool video, audio;
+
+	spin_lock_irqsave(&c->event_lock, flags);
+	video = c->streaming && c->vcap_on && c->base;
+	audio = c->streaming && c->a_started;
+	if (video)
+		hws_program_window(c, c->base->dma, HWS_REG_VBUF(c->index));
+	spin_unlock_irqrestore(&c->event_lock, flags);
+	if (video) {
+		hws_wr(card, HWS_REG_OUT_RES(c->index), c->height << 16 | c->width);
+		hws_wr(card, HWS_REG_VHALF(c->index), c->frame_bytes / 2 / 16);
+		hws_set_bits(card, HWS_REG_VCAP_ENABLE, BIT(c->index), true);
+	}
+	if (audio) {
+		hws_program_window(c, c->aud_dma, HWS_REG_AUDBUF(c->index));
+		hws_set_bits(card, HWS_REG_ACAP_ENABLE, BIT(c->index), true);
+	}
+}
+
+void hws_restore_channels(struct hws_card *card)
+{
+	unsigned int i;
+
+	for (i = 0; i < card->nch; i++)
+		if (card->ch[i])
+			hws_restore_channel(card->ch[i]);
+}
+
+/*
  * Before capture starts: a card that fell off the bus is gone, a core that
- * stopped running is started again (the vendor's driver does the same).
+ * stopped running is started again (the vendor's driver does the same),
+ * and the other channels capturing on it are given their registers back.
  */
 int hws_card_check(struct hws_card *card)
 {
-	u32 status = hws_rd(card, HWS_REG_STATUS);
+	u32 status;
+	int ret = 0;
 
-	if (status == 0xffffffff)
-		return -ENODEV;
-	if (status & HWS_STATUS_RUNNING)
-		return 0;
-	dev_info(&card->pdev->dev, "capture core not running (status 0x%08x), starting it\n", status);
-	return hws_card_start(card);
+	mutex_lock(&card->start_lock);
+	status = hws_rd(card, HWS_REG_STATUS);
+	if (status == 0xffffffff) {
+		ret = -ENODEV;
+	} else if (!(status & HWS_STATUS_RUNNING)) {
+		dev_info(&card->pdev->dev, "capture core not running (status 0x%08x), starting it\n",
+			 status);
+		ret = hws_card_start(card);
+		if (!ret)
+			hws_restore_channels(card);
+	}
+	mutex_unlock(&card->start_lock);
+	return ret;
 }
 
 void hws_read_input(struct hws_card *card, unsigned int ch, struct hws_input *in)
 {
 	u32 active = hws_rd(card, HWS_REG_ACTIVE);
 	u32 res = hws_rd(card, HWS_REG_IN_RES(ch));
-	u32 fps = hws_rd(card, HWS_REG_IN_FPS(ch));
+	u32 fps = card->regs_v1 ? hws_rd(card, HWS_REG_IN_FPS(ch)) : 0;
 
 	memset(in, 0, sizeof(*in));
 	if (active == 0xffffffff)
 		return;
 	in->signal = active & HWS_ACTIVE_SIGNAL(ch);
 	in->interlaced = active & HWS_ACTIVE_INTERLACED(ch);
-	in->hdcp = hws_rd(card, HWS_REG_HDCP) & BIT(ch);
+	in->hdcp = card->regs_v1 && (hws_rd(card, HWS_REG_HDCP) & BIT(ch));
 	if (!in->signal)
 		return;
 	in->width = res & 0xffff;
